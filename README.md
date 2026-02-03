@@ -1,5 +1,6 @@
 # WRTExpand
-
+<a id="en"></a>
+[点击跳转中文版](#cn)
 Automated root partition and filesystem expansion script for **OpenWrt/ImmortalWrt** on ARM devices (optimized for **NanoPi R3S**, Other NanoPi devices should also be compatible.).
 
 ---
@@ -45,7 +46,8 @@ wget -qO- https://raw.githubusercontent.com/MrTangLuyao/wrtexpend/refs/heads/mai
 **Use at your own risk.** This script modifies partition tables. Back up critical data before proceeding.
 
 ---
-
+<a id="cn"></a>
+[Switch to English](#en)
 # 中文说明 (Chinese Version)
 
 适用于 ARM 设备（针对 **NanoPi R3S** 优化, 其他友善科技 NanoPi 系列也应该适用）的 **OpenWrt/ImmortalWrt** 根分区与文件系统自动化扩容脚本。
