@@ -1,5 +1,7 @@
 <a id="en"></a>
-# WRTExpand
+# WRTExpand 
+---
+A easy to use batch auto expend root storage for Firendlyelec NanoPi and compatible Arm devices
 ---
 [点击跳转中文版](#cn)
 ---
