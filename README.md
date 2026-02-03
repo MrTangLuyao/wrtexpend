@@ -1,6 +1,8 @@
-# WRTExpand
 <a id="en"></a>
+# WRTExpand
+---
 [点击跳转中文版](#cn)
+---
 Automated root partition and filesystem expansion script for **OpenWrt/ImmortalWrt** on ARM devices (optimized for **NanoPi R3S**, Other NanoPi devices should also be compatible.).
 
 ---
