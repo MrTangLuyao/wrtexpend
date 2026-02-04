@@ -24,7 +24,14 @@ Execute the following command in your SSH terminal:
 ```bash
 wget -qO- https://raw.githubusercontent.com/MrTangLuyao/wrtexpend/refs/heads/main/expend.sh | sh
 ```
-
+**If the expansion is successful but storage usage is almost full run:**
+```bash
+sync
+reboot
+opkg update
+opkg install tune2fs
+tune2fs -m 1 /dev/mmcblk1p2
+```
 ---
 
 ## Mechanism
@@ -73,7 +80,14 @@ wget -qO- https://raw.githubusercontent.com/MrTangLuyao/wrtexpend/refs/heads/mai
 ```bash
 wget -qO- https://raw.githubusercontent.com/MrTangLuyao/wrtexpend/refs/heads/main/expend.sh | sh
 ```
-
+**如果扩容成功但空间占用却异常的高,请执行:**
+```bash
+sync
+reboot
+opkg update
+opkg install tune2fs
+tune2fs -m 1 /dev/mmcblk1p2
+```
 ---
 
 ## 工作原理
