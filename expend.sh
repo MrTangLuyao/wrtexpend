@@ -1,8 +1,16 @@
 #!/bin/sh
-# ImmortalWrt / OpenWrt ext4 rootfs expand on TF-card:
-# Stage1: use sfdisk to extend partition2 to end-of-disk (no fdisk signature interaction)
-# reboot
-# Stage2: losetup + e2fsck + resize2fs to grow ext4, optional tune2fs -m 1, then cleanup
+# ImmortalWrt/OpenWrt ext4 rootfs expand on TF-card / eMMC
+# Stage1: extend ROOT partition (same partition number) to end-of-disk using sfdisk (no fdisk signature prompt)
+#         (handles sfdisk dump formats where ":" is separated as field2)
+# Stage2 (after reboot): losetup + e2fsck + resize2fs to grow ext4, optional tune2fs -m 1, then cleanup.
+#
+# Usage:
+#   wget -O /tmp/expend.sh <RAW_URL> && sh /tmp/expend.sh
+#
+# Notes:
+# - Works for /dev/mmcblkXpY and /dev/sdXY style names.
+# - Does NOT rely on parsing start= from sfdisk output; uses sysfs start sector.
+# - Does NOT require partprobe/partx; just reboots after rewriting partition table.
 
 set -eu
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
@@ -17,7 +25,7 @@ die(){ echo "[expand][FATAL] $*" >&2; exit 1; }
 need_root(){ [ "$(id -u)" = "0" ] || die "must run as root"; }
 
 opkg_try_install() {
-  # best-effort: user may have damaged opkg *.list; warnings are acceptable
+  # best-effort only; opkg may be noisy if *.list was deleted
   opkg update >/dev/null 2>&1 || true
   opkg install "$@" >/dev/null 2>&1 || opkg install "$@" || true
 }
@@ -28,7 +36,7 @@ resolve_root_dev() {
     echo "$dev"; return
   fi
   majmin="$(awk '$5=="/"{print $3}' /proc/self/mountinfo | head -n1)"
-  [ -n "${majmin:-}" ] || die "cannot resolve root device from mountinfo"
+  [ -n "${majmin:-}" ] || die "cannot resolve root device (mountinfo)"
   sys="$(readlink -f "/sys/dev/block/$majmin" 2>/dev/null || true)"
   [ -n "${sys:-}" ] || die "cannot resolve sysfs block path"
   dev="/dev/$(basename "$sys")"
@@ -112,7 +120,6 @@ fi
 ROOT_DEV="$(resolve_root_dev)"
 log "root device: $ROOT_DEV"
 
-# Tools required
 command -v losetup >/dev/null 2>&1 || exit 1
 command -v e2fsck  >/dev/null 2>&1 || exit 1
 command -v resize2fs >/dev/null 2>&1 || exit 1
@@ -125,13 +132,11 @@ e2fsck -f -y "$LOOP_DEV" || true
 resize2fs "$LOOP_DEV"
 losetup -d "$LOOP_DEV" || true
 
-# optional
 command -v tune2fs >/dev/null 2>&1 && tune2fs -m 1 "$ROOT_DEV" || true
 
 sync
 touch "$MARK_DIR/stage2_done"
 
-# cleanup hook
 [ -f "$RCLOCAL" ] && sed -i "\#$SELF#d" "$RCLOCAL" 2>/dev/null || true
 exit 0
 EOF
@@ -146,12 +151,23 @@ backup_ptable() {
   log "ptable backup: $out"
 }
 
-get_start_from_sysfs() {
-  part="$1"
-  base="$(basename "$part")"
-  f="/sys/class/block/$base/start"
-  [ -r "$f" ] || return 1
-  cat "$f"
+get_start_sector_sysfs() {
+  part="$1"   # /dev/mmcblk1p2
+  disk="$2"   # /dev/mmcblk1
+
+  bpart="$(basename "$part")"
+  bdisk="$(basename "$disk")"
+
+  for f in \
+    "/sys/class/block/$bpart/start" \
+    "/sys/block/$bdisk/$bpart/start"
+  do
+    if [ -r "$f" ]; then
+      cat "$f"
+      return 0
+    fi
+  done
+  return 1
 }
 
 calc_and_apply_sfdisk() {
@@ -161,7 +177,7 @@ calc_and_apply_sfdisk() {
   command -v blockdev >/dev/null 2>&1 || die "blockdev not found"
   command -v sfdisk   >/dev/null 2>&1 || die "sfdisk not found"
 
-  start="$(get_start_from_sysfs "$part" || true)"
+  start="$(get_start_sector_sysfs "$part" "$disk" || true)"
   [ -n "${start:-}" ] || die "cannot read start sector from sysfs for $part"
 
   total="$(blockdev --getsz "$disk")"
@@ -175,22 +191,29 @@ calc_and_apply_sfdisk() {
   new="/tmp/pt.new.sfdisk"
   sfdisk -d "$disk" >"$dump"
 
-  # Match both "/dev/mmcblk1p2" and "/dev/mmcblk1p2:" formats
+  # Robust match: handles both "/dev/mmcblk1p2:" and "/dev/mmcblk1p2 :" (colon as separate field)
   awk -v p="$part" -v ns="$newsize" '
-    $1==p || $1==p":" {
+    (($1==p && $2==":") || ($1==p":")) {
       sub(/size=[0-9]+/, "size="ns)
     }
     {print}
   ' "$dump" >"$new"
+
+  # Safety: ensure replacement actually happened
+  if ! grep -qE "^${part}(:|[[:space:]]+:)[[:space:]].*size=${newsize}([,[:space:]]|$)" "$new"; then
+    die "failed to rewrite size= for $part (dump format unexpected)"
+  fi
 
   sfdisk --no-reread --force "$disk" <"$new"
 }
 
 stage1() {
   mkdir -p "$MARK_DIR"
+
+  # If stage1 already done, do not rewrite partition table again; stage2 will run on next boot.
   if [ -f "$MARK_DIR/stage1_done" ]; then
-    log "stage1 already done"
-    return 0
+    log "stage1 already done; reboot to let stage2 run if needed"
+    exit 0
   fi
 
   ROOT_DEV="$(resolve_root_dev)"
@@ -202,7 +225,6 @@ stage1() {
   log "disk: $DISK  partnum: $PARTNUM"
 
   backup_ptable "$DISK"
-
   calc_and_apply_sfdisk "$DISK" "$ROOT_DEV"
 
   touch "$MARK_DIR/stage1_done"
@@ -214,13 +236,12 @@ stage1() {
 main() {
   need_root
 
-  # Already completed
   if [ -f "$MARK_DIR/stage2_done" ]; then
     log "already completed; nothing to do"
     exit 0
   fi
 
-  # Ensure tools exist (best-effort)
+  # Ensure required tools exist (best-effort)
   opkg_try_install sfdisk losetup resize2fs e2fsprogs tune2fs blockdev
 
   write_stage2
