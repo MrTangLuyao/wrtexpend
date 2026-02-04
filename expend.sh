@@ -1,6 +1,10 @@
 #!/bin/sh
-set -eu
+# ImmortalWrt / OpenWrt ext4 rootfs expand on TF-card:
+# Stage1: use sfdisk to extend partition2 to end-of-disk (no fdisk signature interaction)
+# reboot
+# Stage2: losetup + e2fsck + resize2fs to grow ext4, optional tune2fs -m 1, then cleanup
 
+set -eu
 PATH="/usr/sbin:/usr/bin:/sbin:/bin"
 
 MARK_DIR="/etc/r3s-expand"
@@ -10,7 +14,13 @@ RCLOCAL="/etc/rc.local"
 log(){ echo "[expand] $*"; }
 die(){ echo "[expand][FATAL] $*" >&2; exit 1; }
 
-need_root(){ [ "$(id -u)" = "0" ] || die "run as root"; }
+need_root(){ [ "$(id -u)" = "0" ] || die "must run as root"; }
+
+opkg_try_install() {
+  # best-effort: user may have damaged opkg *.list; warnings are acceptable
+  opkg update >/dev/null 2>&1 || true
+  opkg install "$@" >/dev/null 2>&1 || opkg install "$@" || true
+}
 
 resolve_root_dev() {
   dev="$(readlink -f /dev/root 2>/dev/null || true)"
@@ -18,25 +28,31 @@ resolve_root_dev() {
     echo "$dev"; return
   fi
   majmin="$(awk '$5=="/"{print $3}' /proc/self/mountinfo | head -n1)"
-  [ -n "${majmin:-}" ] || die "cannot resolve root dev"
+  [ -n "${majmin:-}" ] || die "cannot resolve root device from mountinfo"
   sys="$(readlink -f "/sys/dev/block/$majmin" 2>/dev/null || true)"
-  [ -n "${sys:-}" ] || die "cannot resolve sysfs dev"
-  echo "/dev/$(basename "$sys")"
+  [ -n "${sys:-}" ] || die "cannot resolve sysfs block path"
+  dev="/dev/$(basename "$sys")"
+  [ -b "$dev" ] || die "resolved root dev is not block device: $dev"
+  echo "$dev"
 }
 
 split_disk_part() {
   dev="$1"
   case "$dev" in
     /dev/mmcblk*p[0-9]*)
-      echo "${dev%p*} ${dev##*p}"
+      disk="${dev%p*}"
+      partnum="${dev##*p}"
       ;;
     /dev/*[0-9])
-      echo "$(echo "$dev" | sed -E 's/[0-9]+$//') $(echo "$dev" | sed -E 's/^.*[^0-9]([0-9]+)$/\1/')"
+      disk="$(echo "$dev" | sed -E 's/[0-9]+$//')"
+      partnum="$(echo "$dev" | sed -E 's/^.*[^0-9]([0-9]+)$/\1/')"
       ;;
     *)
-      die "unsupported root dev: $dev"
+      die "unsupported root device name: $dev"
       ;;
   esac
+  [ -b "$disk" ] || die "disk is not a block device: $disk"
+  echo "$disk $partnum"
 }
 
 ensure_rc_local() {
@@ -57,6 +73,11 @@ install_stage2_hook() {
   else
     printf "\n%s || true\n" "$STAGE2" >>"$RCLOCAL"
   fi
+}
+
+remove_stage2_hook() {
+  [ -f "$RCLOCAL" ] || return 0
+  sed -i "\#$STAGE2#d" "$RCLOCAL" 2>/dev/null || true
 }
 
 write_stage2() {
@@ -82,110 +103,130 @@ resolve_root_dev() {
   echo "/dev/$(basename "$sys")"
 }
 
-# idempotent
-[ -f "$MARK_DIR/stage2_done" ] && exit 0
+# Idempotent
+if [ -f "$MARK_DIR/stage2_done" ]; then
+  [ -f "$RCLOCAL" ] && sed -i "\#$SELF#d" "$RCLOCAL" 2>/dev/null || true
+  exit 0
+fi
 
 ROOT_DEV="$(resolve_root_dev)"
 log "root device: $ROOT_DEV"
 
+# Tools required
+command -v losetup >/dev/null 2>&1 || exit 1
+command -v e2fsck  >/dev/null 2>&1 || exit 1
+command -v resize2fs >/dev/null 2>&1 || exit 1
+
 LOOP_DEV="$(losetup -f)"
+log "using loop: $LOOP_DEV"
+
 losetup "$LOOP_DEV" "$ROOT_DEV"
 e2fsck -f -y "$LOOP_DEV" || true
 resize2fs "$LOOP_DEV"
 losetup -d "$LOOP_DEV" || true
 
-# optional: reduce reserved blocks (if available)
+# optional
 command -v tune2fs >/dev/null 2>&1 && tune2fs -m 1 "$ROOT_DEV" || true
 
 sync
 touch "$MARK_DIR/stage2_done"
 
-# remove hook
+# cleanup hook
 [ -f "$RCLOCAL" ] && sed -i "\#$SELF#d" "$RCLOCAL" 2>/dev/null || true
 exit 0
 EOF
   chmod +x "$STAGE2"
 }
 
-stage1_resize_partition_with_sfdisk() {
-  mkdir -p "$MARK_DIR"
-  [ -f "$MARK_DIR/stage1_done" ] && return 0
-
-  ROOT_DEV="$(resolve_root_dev)"
-  set -- $(split_disk_part "$ROOT_DEV")
-  DISK="$1"
-  PARTNUM="$2"
-
-  log "root device: $ROOT_DEV"
-  log "disk: $DISK  partnum: $PARTNUM"
-
-  # must have tools
-  command -v sfdisk >/dev/null 2>&1 || die "sfdisk not found"
-  command -v blockdev >/dev/null 2>&1 || die "blockdev not found"
-  command -v losetup >/dev/null 2>&1 || die "losetup not found"
-  command -v e2fsck >/dev/null 2>&1 || die "e2fsck not found"
-  command -v resize2fs >/dev/null 2>&1 || die "resize2fs not found"
-
-  # backup first 2MiB (partition table area)
+backup_ptable() {
+  disk="$1"
   ts="$(date +%Y%m%d_%H%M%S)"
-  dd if="$DISK" of="/root/ptable_backup_${ts}.img" bs=1M count=2 >/dev/null 2>&1 || true
+  out="/root/ptable_backup_${ts}.img"
+  dd if="$disk" of="$out" bs=1M count=2 >/dev/null 2>&1 || true
+  log "ptable backup: $out"
+}
 
-  total="$(blockdev --getsz "$DISK")"
+get_start_from_sysfs() {
+  part="$1"
+  base="$(basename "$part")"
+  f="/sys/class/block/$base/start"
+  [ -r "$f" ] || return 1
+  cat "$f"
+}
 
-  # dump current table
+calc_and_apply_sfdisk() {
+  disk="$1"
+  part="$2"
+
+  command -v blockdev >/dev/null 2>&1 || die "blockdev not found"
+  command -v sfdisk   >/dev/null 2>&1 || die "sfdisk not found"
+
+  start="$(get_start_from_sysfs "$part" || true)"
+  [ -n "${start:-}" ] || die "cannot read start sector from sysfs for $part"
+
+  total="$(blockdev --getsz "$disk")"
+  [ -n "${total:-}" ] || die "cannot get disk total sectors"
+  newsize=$(( total - start ))
+  [ "$newsize" -gt 0 ] || die "computed new size invalid"
+
+  log "start=$start total=$total new_size=$newsize"
+
   dump="/tmp/pt.sfdisk"
   new="/tmp/pt.new.sfdisk"
-  sfdisk -d "$DISK" >"$dump"
+  sfdisk -d "$disk" >"$dump"
 
-  # extract start of ROOT_DEV from dump
-  start="$(awk -v p="$ROOT_DEV" '
-    $1==p {for(i=1;i<=NF;i++) if($i ~ /^start=/){gsub(/start=/,"",$i); gsub(/,/, "", $i); print $i; exit}}
-  ' "$dump")"
-  [ -n "${start:-}" ] || die "cannot parse start sector from sfdisk dump"
-
-  # compute new size to end-of-disk
-  newsize=$(( total - start ))
-  [ "$newsize" -gt 0 ] || die "computed size invalid"
-
-  log "start=$start  total=$total  new_size=$newsize"
-
-  # replace size= for ROOT_DEV line only
-  awk -v p="$ROOT_DEV" -v ns="$newsize" '
-    $1==p {
-      sub(/size=[0-9]+/, "size="ns);
+  # Match both "/dev/mmcblk1p2" and "/dev/mmcblk1p2:" formats
+  awk -v p="$part" -v ns="$newsize" '
+    $1==p || $1==p":" {
+      sub(/size=[0-9]+/, "size="ns)
     }
     {print}
   ' "$dump" >"$new"
 
-  # write table back; --no-reread because disk is in use; reboot will reload table
-  sfdisk --no-reread --force "$DISK" <"$new"
+  sfdisk --no-reread --force "$disk" <"$new"
+}
+
+stage1() {
+  mkdir -p "$MARK_DIR"
+  if [ -f "$MARK_DIR/stage1_done" ]; then
+    log "stage1 already done"
+    return 0
+  fi
+
+  ROOT_DEV="$(resolve_root_dev)"
+  log "root device: $ROOT_DEV"
+
+  set -- $(split_disk_part "$ROOT_DEV")
+  DISK="$1"
+  PARTNUM="$2"
+  log "disk: $DISK  partnum: $PARTNUM"
+
+  backup_ptable "$DISK"
+
+  calc_and_apply_sfdisk "$DISK" "$ROOT_DEV"
 
   touch "$MARK_DIR/stage1_done"
+  sync
+  log "partition table updated; rebooting to reload table; stage2 will run on boot"
+  reboot
 }
 
 main() {
   need_root
 
-  mkdir -p "$MARK_DIR"
-
-  # stage2 already done
+  # Already completed
   if [ -f "$MARK_DIR/stage2_done" ]; then
-    log "already completed"
+    log "already completed; nothing to do"
     exit 0
   fi
 
-  # install tools (your opkg info/*.list 已经被你删过，会一直刷 warning；不影响安装成功)
-  opkg update >/dev/null 2>&1 || true
-  opkg install sfdisk losetup resize2fs e2fsprogs tune2fs blockdev >/dev/null 2>&1 || true
+  # Ensure tools exist (best-effort)
+  opkg_try_install sfdisk losetup resize2fs e2fsprogs tune2fs blockdev
 
   write_stage2
   install_stage2_hook
 
-  stage1_resize_partition_with_sfdisk
-
-  log "partition updated; rebooting to reload partition table; stage2 will run on boot"
-  sync
-  reboot
+  stage1
 }
 
 main
