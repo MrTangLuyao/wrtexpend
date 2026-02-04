@@ -16,7 +16,9 @@ LOOP_DEV=$(/usr/sbin/losetup -f)
 /usr/sbin/losetup "$LOOP_DEV" "$PART"
 /usr/sbin/e2fsck -fy "$LOOP_DEV"
 /usr/sbin/resize2fs "$LOOP_DEV"
+/usr/sbin/tune2fs -m 1 "$LOOP_DEV"
 /usr/sbin/losetup -d "$LOOP_DEV"
 
 sync
+echo "Expansion complete."
 reboot
