@@ -1,19 +1,20 @@
 #!/bin/sh
-# ImmortalWrt/OpenWrt ext4 rootfs expand on TF-card / eMMC
-# Stage1: extend ROOT partition (same partition number) to end-of-disk using sfdisk (no fdisk signature prompt)
-#         (handles sfdisk dump formats where ":" is separated as field2)
-# Stage2 (after reboot): losetup + e2fsck + resize2fs to grow ext4, optional tune2fs -m 1, then cleanup.
+# ImmortalWrt / OpenWrt 一键扩容（按你最开始成功的“环/loop”思路）
+# 目标：只扩 root 所在分区，不重建分区表、不动其他分区
+# 流程：
+#   Stage1(当前运行)：sfdisk -N <root分区号> 把分区扩到剩余空间 -> 写入开机自启 Stage2 -> reboot
+#   Stage2(重启后自动)：losetup + e2fsck + resize2fs 扩 ext4 -> 可选 tune2fs -m 1 -> 清理自启标记
 #
-# Usage:
-#   wget -O /tmp/expend.sh <RAW_URL> && sh /tmp/expend.sh
+# 用法：
+#   sh expend.sh
 #
-# Notes:
-# - Works for /dev/mmcblkXpY and /dev/sdXY style names.
-# - Does NOT rely on parsing start= from sfdisk output; uses sysfs start sector.
-# - Does NOT require partprobe/partx; just reboots after rewriting partition table.
+# 说明：
+# - “Re-reading the partition table failed.: Resource busy” 属于正常现象（根分区在用），重启后生效。
 
 set -eu
-PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+
+# ===== 固定 PATH（你最开始成功里就靠这个避免找不到 /usr/sbin 下命令）=====
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 MARK_DIR="/etc/r3s-expand"
 STAGE2="/usr/sbin/r3s-expand-stage2.sh"
@@ -25,7 +26,7 @@ die(){ echo "[expand][FATAL] $*" >&2; exit 1; }
 need_root(){ [ "$(id -u)" = "0" ] || die "must run as root"; }
 
 opkg_try_install() {
-  # best-effort only; opkg may be noisy if *.list was deleted
+  # 你之前删过 /usr/lib/opkg/info/*.list 会导致 warning；不影响安装，忽略即可
   opkg update >/dev/null 2>&1 || true
   opkg install "$@" >/dev/null 2>&1 || opkg install "$@" || true
 }
@@ -93,7 +94,7 @@ write_stage2() {
   cat >"$STAGE2" <<'EOF'
 #!/bin/sh
 set -eu
-PATH="/usr/sbin:/usr/bin:/sbin:/bin"
+export PATH="/usr/sbin:/usr/bin:/sbin:/bin:$PATH"
 
 MARK_DIR="/etc/r3s-expand"
 RCLOCAL="/etc/rc.local"
@@ -111,7 +112,7 @@ resolve_root_dev() {
   echo "/dev/$(basename "$sys")"
 }
 
-# Idempotent
+# 已完成就清理并退出（可重复运行不伤）
 if [ -f "$MARK_DIR/stage2_done" ]; then
   [ -f "$RCLOCAL" ] && sed -i "\#$SELF#d" "$RCLOCAL" 2>/dev/null || true
   exit 0
@@ -127,16 +128,19 @@ command -v resize2fs >/dev/null 2>&1 || exit 1
 LOOP_DEV="$(losetup -f)"
 log "using loop: $LOOP_DEV"
 
+# 关键：环/loop 思路（对 loop 做 fsck+resize）
 losetup "$LOOP_DEV" "$ROOT_DEV"
 e2fsck -f -y "$LOOP_DEV" || true
 resize2fs "$LOOP_DEV"
 losetup -d "$LOOP_DEV" || true
 
+# 可选：保留块降到 1%
 command -v tune2fs >/dev/null 2>&1 && tune2fs -m 1 "$ROOT_DEV" || true
 
 sync
 touch "$MARK_DIR/stage2_done"
 
+# 清理自启
 [ -f "$RCLOCAL" ] && sed -i "\#$SELF#d" "$RCLOCAL" 2>/dev/null || true
 exit 0
 EOF
@@ -151,71 +155,7 @@ backup_ptable() {
   log "ptable backup: $out"
 }
 
-get_start_sector_sysfs() {
-  part="$1"   # /dev/mmcblk1p2
-  disk="$2"   # /dev/mmcblk1
-
-  bpart="$(basename "$part")"
-  bdisk="$(basename "$disk")"
-
-  for f in \
-    "/sys/class/block/$bpart/start" \
-    "/sys/block/$bdisk/$bpart/start"
-  do
-    if [ -r "$f" ]; then
-      cat "$f"
-      return 0
-    fi
-  done
-  return 1
-}
-
-calc_and_apply_sfdisk() {
-  disk="$1"
-  part="$2"
-
-  command -v blockdev >/dev/null 2>&1 || die "blockdev not found"
-  command -v sfdisk   >/dev/null 2>&1 || die "sfdisk not found"
-
-  start="$(get_start_sector_sysfs "$part" "$disk" || true)"
-  [ -n "${start:-}" ] || die "cannot read start sector from sysfs for $part"
-
-  total="$(blockdev --getsz "$disk")"
-  [ -n "${total:-}" ] || die "cannot get disk total sectors"
-  newsize=$(( total - start ))
-  [ "$newsize" -gt 0 ] || die "computed new size invalid"
-
-  log "start=$start total=$total new_size=$newsize"
-
-  dump="/tmp/pt.sfdisk"
-  new="/tmp/pt.new.sfdisk"
-  sfdisk -d "$disk" >"$dump"
-
-  # Robust match: handles both "/dev/mmcblk1p2:" and "/dev/mmcblk1p2 :" (colon as separate field)
-  awk -v p="$part" -v ns="$newsize" '
-    (($1==p && $2==":") || ($1==p":")) {
-      sub(/size=[0-9]+/, "size="ns)
-    }
-    {print}
-  ' "$dump" >"$new"
-
-  # Safety: ensure replacement actually happened
-  if ! grep -qE "^${part}(:|[[:space:]]+:)[[:space:]].*size=${newsize}([,[:space:]]|$)" "$new"; then
-    die "failed to rewrite size= for $part (dump format unexpected)"
-  fi
-
-  sfdisk --no-reread --force "$disk" <"$new"
-}
-
-stage1() {
-  mkdir -p "$MARK_DIR"
-
-  # If stage1 already done, do not rewrite partition table again; stage2 will run on next boot.
-  if [ -f "$MARK_DIR/stage1_done" ]; then
-    log "stage1 already done; reboot to let stage2 run if needed"
-    exit 0
-  fi
-
+stage1_expand_partition_only() {
   ROOT_DEV="$(resolve_root_dev)"
   log "root device: $ROOT_DEV"
 
@@ -224,30 +164,44 @@ stage1() {
   PARTNUM="$2"
   log "disk: $DISK  partnum: $PARTNUM"
 
-  backup_ptable "$DISK"
-  calc_and_apply_sfdisk "$DISK" "$ROOT_DEV"
+  # 工具存在性
+  command -v sfdisk >/dev/null 2>&1 || die "sfdisk not found"
+  command -v fdisk  >/dev/null 2>&1 || true
 
-  touch "$MARK_DIR/stage1_done"
+  backup_ptable "$DISK"
+
+  # 只修改指定分区（不重建 disklabel，不动其他分区）
+  # 输入 ", +" 表示：保持 start 不变，size 设为“剩余全部”
+  # 这一步在线重读通常会提示 Resource busy —— 正常，重启后生效
+  log "expanding partition $PARTNUM on $DISK to fill remaining space"
+  sfdisk --force -N "$PARTNUM" "$DISK" <<EOF
+, +
+EOF
+
   sync
-  log "partition table updated; rebooting to reload table; stage2 will run on boot"
-  reboot
 }
 
 main() {
   need_root
 
-  if [ -f "$MARK_DIR/stage2_done" ]; then
-    log "already completed; nothing to do"
-    exit 0
-  fi
+  # 一键从 0 开始：不信任何旧标记，先清掉（只清理本脚本的标记与 hook）
+  rm -f "$MARK_DIR/stage2_done" "$MARK_DIR/stage1_done" 2>/dev/null || true
+  remove_stage2_hook || true
 
-  # Ensure required tools exist (best-effort)
-  opkg_try_install sfdisk losetup resize2fs e2fsprogs tune2fs blockdev
+  # 安装必要组件（最少集：sfdisk/losetup/resize2fs/e2fsprogs/tune2fs）
+  opkg_try_install sfdisk losetup resize2fs e2fsprogs tune2fs
 
+  # 写入并挂载 Stage2
   write_stage2
   install_stage2_hook
 
-  stage1
+  # Stage1：扩分区
+  stage1_expand_partition_only
+
+  touch "$MARK_DIR/stage1_done" 2>/dev/null || true
+  sync
+  log "stage1 done; rebooting (stage2 will run automatically on boot)"
+  reboot
 }
 
 main
