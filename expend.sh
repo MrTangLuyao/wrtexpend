@@ -9,7 +9,6 @@ die(){ echo "[expand][FATAL] $*" >&2; exit 1; }
 need_root(){ [ "$(id -u)" = "0" ] || die "must run as root"; }
 PKG_MANAGER=""
 detect_package_manager() {
-  # OpenWrt/ImmortalWrt 25.x uses apk; older releases use opkg.
   if command -v apk >/dev/null 2>&1; then
     PKG_MANAGER="apk"
   elif command -v opkg >/dev/null 2>&1; then
@@ -19,56 +18,58 @@ detect_package_manager() {
   fi
   log "package manager: $PKG_MANAGER"
 }
-pkg_update() {
-  case "$PKG_MANAGER" in
-    apk) apk update >/dev/null 2>&1 || true ;;
-    opkg) opkg update >/dev/null 2>&1 || true ;;
-  esac
-}
 pkg_try_install() {
   case "$PKG_MANAGER" in
-    apk) apk add "$@" >/dev/null 2>&1 || apk add "$@" || true ;;
-    opkg) opkg install "$@" >/dev/null 2>&1 || opkg install "$@" || true ;;
+    apk)
+      apk update >/dev/null 2>&1 || true
+      apk add "$@" >/dev/null 2>&1 || apk add "$@" || true
+      ;;
+    opkg)
+      opkg update >/dev/null 2>&1 || true
+      opkg install "$@" >/dev/null 2>&1 || opkg install "$@" || true
+      ;;
   esac
 }
-ensure_tool() {
-  tool="$1"
-  shift
-  command -v "$tool" >/dev/null 2>&1 && return 0
-  for package in "$@"; do
-    pkg_try_install "$package"
-    command -v "$tool" >/dev/null 2>&1 && return 0
-  done
-  die "required command not found after package installation: $tool"
+overlay_device() {
+  awk '$2=="/overlay" {print $1; exit}' /proc/mounts 2>/dev/null || true
 }
-install_dependencies() {
-  pkg_update
-  # Package names changed with the apk-based OpenWrt/ImmortalWrt 25.x feeds.
-  # Try the current split packages first, then the old package names.
-  ensure_tool sfdisk    util-linux-sfdisk sfdisk
-  ensure_tool losetup   util-linux-losetup losetup
-  ensure_tool e2fsck    e2fsprogs-e2fsck e2fsprogs
-  ensure_tool resize2fs e2fsprogs-resize2fs resize2fs e2fsprogs
-  ensure_tool tune2fs   e2fsprogs-tune2fs tune2fs e2fsprogs
+loop_backing_partition() {
+  loop="$1"
+  backing="$(cat "/sys/class/block/${loop##*/}/loop/backing_file" 2>/dev/null || true)"
+  case "$backing" in
+    /dev/*) dev="$backing" ;;
+    /*) dev="/dev$backing" ;;
+    *) die "cannot resolve loop backing device for $loop" ;;
+  esac
+  [ -b "$dev" ] || die "loop backing device is not a block device: $dev"
+  echo "$dev"
 }
-resolve_root_dev() {
+resolve_root_partition() {
   dev="$(readlink -f /dev/root 2>/dev/null || true)"
   if [ -n "${dev:-}" ] && [ -b "$dev" ]; then
     echo "$dev"; return
   fi
-  # On current OpenWrt/ImmortalWrt, / is often overlayfs (major:minor 0:*).
-  # Its writable backing Ext4 partition is mounted at /overlay.
-  dev="$(awk '$2=="/overlay" {print $1; exit}' /proc/mounts 2>/dev/null || true)"
+  dev="$(overlay_device)"
+  case "$dev" in
+    /dev/loop*) loop_backing_partition "$dev"; return ;;
+  esac
   if [ -n "${dev:-}" ] && [ -b "$dev" ]; then
     echo "$dev"; return
   fi
   majmin="$(awk '$5=="/"{print $3}' /proc/self/mountinfo | head -n1)"
   [ -n "${majmin:-}" ] || die "cannot resolve root device (mountinfo)"
   sys="$(readlink -f "/sys/dev/block/$majmin" 2>/dev/null || true)"
-  [ -n "${sys:-}" ] || die "cannot resolve root device; / is overlayfs and /overlay is not a block device"
+  [ -n "${sys:-}" ] || die "cannot resolve sysfs block path"
   dev="/dev/$(basename "$sys")"
-  [ -b "$dev" ] || die "cannot resolve root device; / is overlayfs and /overlay is not a block device"
+  [ -b "$dev" ] || die "resolved root dev is not block device: $dev"
   echo "$dev"
+}
+resolve_filesystem_device() {
+  dev="$(overlay_device)"
+  if [ -n "${dev:-}" ] && [ -b "$dev" ]; then
+    echo "$dev"; return
+  fi
+  resolve_root_partition
 }
 split_disk_part() {
   dev="$1"
@@ -120,44 +121,34 @@ MARK_DIR="/etc/r3s-expand"
 RCLOCAL="/etc/rc.local"
 SELF="/usr/sbin/r3s-expand-stage2.sh"
 log(){ echo "[expand][stage2] $*"; }
-resolve_root_dev() {
-  dev="$(readlink -f /dev/root 2>/dev/null || true)"
-  if [ -n "${dev:-}" ] && [ -b "$dev" ]; then
-    echo "$dev"; return
-  fi
+filesystem_device() {
   dev="$(awk '$2=="/overlay" {print $1; exit}' /proc/mounts 2>/dev/null || true)"
   if [ -n "${dev:-}" ] && [ -b "$dev" ]; then
     echo "$dev"; return
   fi
-  majmin="$(awk '$5=="/"{print $3}' /proc/self/mountinfo | head -n1)"
-  sys="$(readlink -f "/sys/dev/block/$majmin" 2>/dev/null || true)"
-  [ -n "${sys:-}" ] || exit 1
-  dev="/dev/$(basename "$sys")"
-  [ -b "$dev" ] || exit 1
+  dev="$(readlink -f /dev/root 2>/dev/null || true)"
+  [ -n "${dev:-}" ] && [ -b "$dev" ] || return 1
   echo "$dev"
 }
 if [ -f "$MARK_DIR/stage2_done" ]; then
   [ -f "$RCLOCAL" ] && sed -i "\#$SELF#d" "$RCLOCAL" 2>/dev/null || true
   exit 0
 fi
-ROOT_DEV="$(resolve_root_dev)"
-log "root device: $ROOT_DEV"
-command -v losetup >/dev/null 2>&1 || exit 1
-command -v e2fsck  >/dev/null 2>&1 || exit 1
+FS_DEV="$(filesystem_device)" || exit 1
+log "filesystem device: $FS_DEV"
 command -v resize2fs >/dev/null 2>&1 || exit 1
-command -v tune2fs >/dev/null 2>&1 || exit 1
-LOOP_DEV="$(losetup -f)"
-log "using loop: $LOOP_DEV"
-losetup "$LOOP_DEV" "$ROOT_DEV"
-e2fsck -f -y "$LOOP_DEV" || true
-resize2fs "$LOOP_DEV"
-losetup -d "$LOOP_DEV" || true
-tune2fs -m 1 "$ROOT_DEV" 2>/dev/null || true
+case "$FS_DEV" in
+  /dev/loop*)
+    command -v losetup >/dev/null 2>&1 || exit 1
+    # The partition grew during stage 1; refresh the existing loop device.
+    losetup -c "$FS_DEV"
+    ;;
+esac
+resize2fs "$FS_DEV"
 sync
 touch "$MARK_DIR/stage2_done"
 [ -f "$RCLOCAL" ] && sed -i "\#$SELF#d" "$RCLOCAL" 2>/dev/null || true
 sync
-reboot
 EOF
   chmod +x "$STAGE2"
 }
@@ -169,9 +160,9 @@ backup_ptable() {
   log "ptable backup: $out"
 }
 stage1_expand_partition_only() {
-  ROOT_DEV="$(resolve_root_dev)"
-  log "root device: $ROOT_DEV"
-  set -- $(split_disk_part "$ROOT_DEV")
+  ROOT_PART="$(resolve_root_partition)"
+  log "root partition: $ROOT_PART"
+  set -- $(split_disk_part "$ROOT_PART")
   DISK="$1"
   PARTNUM="$2"
   log "disk: $DISK  partnum: $PARTNUM"
@@ -189,10 +180,10 @@ main() {
   detect_package_manager
   rm -f "$MARK_DIR/stage2_done" "$MARK_DIR/stage1_done" 2>/dev/null || true
   remove_stage2_hook || true
-  install_dependencies
+  pkg_try_install sfdisk losetup resize2fs
+  stage1_expand_partition_only
   write_stage2
   install_stage2_hook
-  stage1_expand_partition_only
   touch "$MARK_DIR/stage1_done" 2>/dev/null || true
   sync
   log "stage1 done; rebooting (stage2 will run automatically on boot)"
